@@ -14,8 +14,7 @@ extern crate futures;
 
 use std::fmt;
 
-use futures::{Future, IntoFuture, Stream, Poll, Async};
-use futures::future::Either;
+use futures::{stream, Future, IntoFuture, Stream, Poll, Async};
 
 /// Errors occurring from threshold decryption.
 pub trait ThresholdDecryptionError: ::std::error::Error {
@@ -214,6 +213,8 @@ pub fn honey_badger_bft<'a, P, T, A, S>(proposal: P::Proposal, tpke: T, acs: A, 
         T: ThresholdEncryption + Clone,
         A: AsyncCommonSubset,
         S: ShareExchange<T::Share>,
+
+        P::Error: 'a,       
         A::Error: 'a,
 {
     let proposal_bytes = proposal.into();
@@ -224,16 +225,35 @@ pub fn honey_badger_bft<'a, P, T, A, S>(proposal: P::Proposal, tpke: T, acs: A, 
         .into_future()
         .map_err(|e| Box::new(e) as Box<_>)
         .and_then(move |agreed_ciphertexts| {
+            let mut accumulating = Vec::new();
             for (origin, ciphertext) in agreed_ciphertexts {
                 let decrypt_share = match tpke.decrypt_share(&ciphertext) {
                     Ok(share) => Some(share),
                     Err(_) => None,
                 };
 
-                unimplemented!()
+                let inner = se.exchange_shares(origin, decrypt_share.clone());
+
+                accumulating.push(ShareAccumulator::create(
+                    tpke.clone(), 
+                    ciphertext, 
+                    inner, 
+                    decrypt_share
+                ).map_err(|e| Box::new(e) as Box<_>));
             }
 
-            Ok(unimplemented!())
+            // the `then` call right now swallows errors so fold doesn't exit
+            // prematurely.
+            //
+            // further on, we can return a (Block, JustifiedError) from the future.
+            stream::futures_unordered(accumulating)
+                .and_then(|p| P::decode_proposal(&p).map_err(|e| Box::new(e) as Box<::std::error::Error>))
+                .then(|item| Ok(item.ok())) 
+                .fold(Vec::new(), |mut v, item| {
+                    if let Some(item) = item { v.push(item) }
+                    Ok::<_, Box<::std::error::Error>>(v)
+                })
+                .map(P::combine_proposals)
         });
 
     future.wait()
